@@ -4,7 +4,8 @@ description: >
   Consult Codex CLI (ChatGPT login) from Grok for a second opinion, plan
   critique, uncommitted/branch/commit review, or occasional implementation.
   Use when the user says "ask Codex", "Codex review", "OpenAI second opinion",
-  "have Codex look at", or codex-consult. Never auto-invoke. Never parallel.
+  "have Codex look at", or codex-consult. Never auto-invoke. One Codex at
+  a time. Parallel with claude-consult only when the user asked for both.
   Grok stays the default agent. Default model gpt-5.6-sol. Skip if `codex`
   is not on PATH.
 ---
@@ -13,15 +14,18 @@ description: >
 
 Grok is the daily driver. Requires local Codex CLI (`codex login`, ChatGPT subscription). Codex is part of that subscription.
 
-Wrapper (plugin install sets `GROK_PLUGIN_ROOT`; `CLAUDE_PLUGIN_ROOT` is an alias). If both are empty, the wrapper is `../../scripts/codex-consult` relative to this skill file.
+Plugin install sets `GROK_PLUGIN_ROOT` (`CLAUDE_PLUGIN_ROOT` is an alias).
 
 ```bash
-CODEX_CONSULT="${GROK_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/codex-consult"
+ROOT="${GROK_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+CODEX_CONSULT="${ROOT}/scripts/codex-consult"
 ```
+
+If `ROOT` is empty, set `CODEX_CONSULT` to `../../scripts/codex-consult` relative to this SKILL.md (this file is in `skills/codex-consult/`).
 
 ## Run
 
-Shell tool **timeout must be 960000 ms**. Put the plan/diff on **stdin**.
+Shell tool **timeout must be 960000 ms** so the wrapper (default 900s) can return exit 124 with partial stdout. Put the prompt on **stdin**.
 
 ```bash
 "$CODEX_CONSULT" --mode opinion --stdin <<'EOF'
@@ -56,7 +60,7 @@ Review targets (exclusive): default `--uncommitted` · `--base <branch>` · `--c
 ## Steps
 
 1. Default to `opinion`. Full plan/diff via `--stdin`. Add `--model` / `--effort` only if named.
-2. `review`: `--cwd` = git root.
+2. `review`: `--cwd` = git root. One target flag (default `--uncommitted`). Stdin is extra instructions, not a second copy of the diff. `read`: `--cwd` = repo.
 3. `implement`: only if the user asked for edits.
 4. Relay **stdout** attributed to Codex. Exit 124 is a timeout: say so, and if stdout is non-empty show it as a partial answer. Other non-zero exits with stdout: still treat stdout as the answer (stderr warnings are not a failure). Stop only when the command fails **and** stdout is empty.
 5. Auth: `codex login status` / `codex login`. Wrapper unsets API keys and common secret env vars.
@@ -65,4 +69,5 @@ Review targets (exclusive): default `--uncommitted` · `--base <branch>` · `--c
 
 - Call `codex` directly.
 - Put a long prompt on argv. Use `--stdin`.
-- `--cwd ~/.grok` or `$HOME`. Parallel consults unless the user asked.
+- `--cwd ~/.grok` or `$HOME`.
+- Run two Codex consults at once. One Codex + one Claude in parallel is OK when the user asked for both.

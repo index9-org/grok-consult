@@ -5,7 +5,8 @@ description: >
   opinion, plan critique, diff review, or occasional implementation. Use when
   the user says "ask Claude", "Claude's opinion", "have Claude review",
   "second opinion from Claude Code", or claude-consult. Never auto-invoke.
-  Never parallel. Grok stays the default agent. Prefer brain-only opinion
+  One Claude at a time. Parallel with codex-consult only when the user
+  asked for both. Grok stays the default agent. Prefer brain-only opinion
   mode. Skip if `claude` is not on PATH.
 ---
 
@@ -13,15 +14,18 @@ description: >
 
 Grok is the daily driver. Requires local Claude Code (`claude auth login`, Pro or Max). Never `--bare`.
 
-Wrapper (plugin install sets `GROK_PLUGIN_ROOT`; `CLAUDE_PLUGIN_ROOT` is an alias). If both are empty, the wrapper is `../../scripts/claude-consult` relative to this skill file.
+Plugin install sets `GROK_PLUGIN_ROOT` (`CLAUDE_PLUGIN_ROOT` is an alias).
 
 ```bash
-CLAUDE_CONSULT="${GROK_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/claude-consult"
+ROOT="${GROK_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+CLAUDE_CONSULT="${ROOT}/scripts/claude-consult"
 ```
+
+If `ROOT` is empty, set `CLAUDE_CONSULT` to `../../scripts/claude-consult` relative to this SKILL.md (this file is in `skills/claude-consult/`).
 
 ## Run
 
-Shell tool **timeout must be 960000 ms**. Put the plan/diff on **stdin**.
+Shell tool **timeout must be 960000 ms** so the wrapper (default 900s) can return exit 124 with partial stdout. Put the plan/diff on **stdin**.
 
 ```bash
 "$CLAUDE_CONSULT" --mode opinion --stdin <<'EOF'
@@ -54,7 +58,7 @@ Empty stdin fails (including a clean `git diff`). That is expected.
 ## Steps
 
 1. Default to `opinion`. Full plan/diff via `--stdin`. Add `--model` / `--effort` only if named.
-2. `review`/`read`: `--cwd` = repo. Paste diffs; Claude cannot run Bash.
+2. `review`/`read`: `--cwd` = repo. For `review`, pipe the diff they asked for (default `git diff HEAD`). Empty diff: stop; that is expected. Claude cannot run Bash.
 3. `implement`: only if the user asked for edits; confirm if unclear.
 4. Relay **stdout** attributed to Claude. Exit 124 is a timeout: say so, and if stdout is non-empty show it as a partial answer. Other non-zero exits with stdout: still treat stdout as the answer (stderr warnings are not a failure). Stop only when the command fails **and** stdout is empty.
 5. Auth: `claude auth status` / `claude auth login`. No API keys.
@@ -63,4 +67,5 @@ Empty stdin fails (including a clean `git diff`). That is expected.
 
 - Call `claude` directly.
 - Put a long prompt on argv. Use `--stdin`.
-- Use `--bare`, `--cwd ~/.grok`, or parallel consults unless the user asked.
+- Use `--bare` or `--cwd ~/.grok`.
+- Run two Claude consults at once. One Claude + one Codex in parallel is OK when the user asked for both.

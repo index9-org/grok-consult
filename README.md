@@ -2,7 +2,7 @@
 
 From Grok Build, ask your local Claude Code or Codex CLI for a second opinion. Grok stays the daily driver. Never auto-invoke.
 
-You need one of Claude or Codex, not both.
+You only need one CLI installed (Claude or Codex). If you have both, you can ask Grok for both at once.
 
 ## Install
 
@@ -25,7 +25,7 @@ The wrappers only spawn those local CLIs. Claude and Codex then talk to their ow
 
 ## Use
 
-From Grok: "ask Claude …" or "ask Codex …". Skills: `claude-consult`, `codex-consult`.
+From Grok: "ask Claude …" or "ask Codex …". If you ask for both, Grok runs one of each together. Skills: `claude-consult`, `codex-consult`.
 
 ```bash
 # plugin directory, or $GROK_PLUGIN_ROOT after install
