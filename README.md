@@ -7,7 +7,7 @@ You need **one** of Claude or Codex, not both.
 ## Install
 
 ```bash
-grok plugin install johnwils/grok-consult --trust
+grok plugin install index9-org/grok-consult --trust
 ```
 
 Reload plugins (`r` in the Plugins tab, or a new session).

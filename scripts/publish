@@ -16,7 +16,7 @@ if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
 fi
 if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
   echo "publish: no origin remote. Create one, then retry:" >&2
-  echo "  gh repo create johnwils/grok-consult --public --source=. --remote=origin --push" >&2
+  echo "  gh repo create index9-org/grok-consult --public --source=. --remote=origin --push" >&2
   exit 1
 fi
 

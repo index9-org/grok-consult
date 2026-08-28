@@ -1,13 +1,13 @@
 {
   "name": "consult",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Consult local Claude Code (Pro or Max) and/or Codex CLI (ChatGPT) from Grok Build. Never auto-invoke.",
   "author": {
-    "name": "John Wilson",
-    "url": "https://github.com/johnwils"
+    "name": "index9",
+    "url": "https://github.com/index9-org"
   },
-  "repository": "https://github.com/johnwils/grok-consult",
-  "homepage": "https://github.com/johnwils/grok-consult",
+  "repository": "https://github.com/index9-org/grok-consult",
+  "homepage": "https://github.com/index9-org/grok-consult",
   "license": "MIT",
   "keywords": ["claude", "codex", "grok", "consult"]
 }
