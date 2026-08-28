@@ -48,9 +48,14 @@ Approvals: `approval_policy=never`. Always `--ephemeral`. Opinion uses `--ignore
 
 Review targets (exclusive): default `--uncommitted` · `--base <branch>` · `--commit <sha>`.
 
+`--model` and `--effort` only when the user names them. Otherwise omit (wrapper defaults: model `gpt-5.6-sol`, effort `high`, `read` is `medium`).
+
+- `--model` default `gpt-5.6-sol`
+- `--effort` `low` | `medium` | `high` | `xhigh` | `max`
+
 ## Steps
 
-1. Default to `opinion`. Full plan/diff via `--stdin`.
+1. Default to `opinion`. Full plan/diff via `--stdin`. Add `--model` / `--effort` only if named.
 2. `review`: `--cwd` = git root.
 3. `implement`: only if the user asked for edits.
 4. Relay **stdout** attributed to Codex. Exit 124 is a timeout: say so, and if stdout is non-empty show it as a partial answer. Other non-zero exits with stdout: still treat stdout as the answer (stderr warnings are not a failure). Stop only when the command fails **and** stdout is empty.

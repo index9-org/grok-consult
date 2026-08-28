@@ -1,6 +1,6 @@
 {
   "name": "consult",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Ask local Claude Code (Pro or Max) and/or Codex CLI (ChatGPT) for a second opinion from Grok Build. Never auto-invoke.",
   "author": {
     "name": "index9",

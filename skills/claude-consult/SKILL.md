@@ -46,9 +46,14 @@ Empty stdin fails (including a clean `git diff`). That is expected.
 
 `--cwd` = git root for review/read/implement. Omit for opinion. Never `~/.grok` or `$HOME`.
 
+`--model` and `--effort` only when the user names them. Otherwise omit (wrapper defaults: model `opus`, effort `high`, `read` is `medium`).
+
+- `--model` `sonnet` | `opus` | `fable` | full id (`claude-opus-5`, `claude-opus-4-8`, `claude-fable-5`). Full id if they do not want latest.
+- `--effort` `low` | `medium` | `high` | `xhigh` | `max`
+
 ## Steps
 
-1. Default to `opinion`. Full plan/diff via `--stdin`.
+1. Default to `opinion`. Full plan/diff via `--stdin`. Add `--model` / `--effort` only if named.
 2. `review`/`read`: `--cwd` = repo. Paste diffs; Claude cannot run Bash.
 3. `implement`: only if the user asked for edits; confirm if unclear.
 4. Relay **stdout** attributed to Claude. Exit 124 is a timeout: say so, and if stdout is non-empty show it as a partial answer. Other non-zero exits with stdout: still treat stdout as the answer (stderr warnings are not a failure). Stop only when the command fails **and** stdout is empty.

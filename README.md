@@ -34,7 +34,7 @@ Review this plan: …
 EOF
 ```
 
-Same for `codex-consult`. Modes: `opinion` (default), `review`, `read`, `implement`.
+Same for `codex-consult`. Modes: `opinion` (default), `review`, `read`, `implement`. Optional `--model` and `--effort` (`low` | `medium` | `high` | `xhigh` | `max`). Claude defaults to `opus`; Codex to `gpt-5.6-sol`. Effort defaults to `high` (`read`: `medium`).
 
 Grok shell timeout: 960000 ms. Wrapper default kill: 900s.
 
