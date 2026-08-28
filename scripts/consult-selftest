@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# consult-selftest — no live model calls. Does not need `claude` or `codex` on PATH.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+TO="$ROOT/consult-timeout"
+CL="$ROOT/claude-consult"
+CX="$ROOT/codex-consult"
+TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/consult-selftest.XXXXXX")"
+ERR="$TEST_TMP/err"
+fail=0
+
+ok() { printf 'ok  %s\n' "$*"; }
+bad() { printf 'FAIL %s\n' "$*" >&2; fail=1; }
+cleanup() { rm -rf "$TEST_TMP"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+[[ -x "$TO" && -x "$CL" && -x "$CX" ]] || { echo "missing executables" >&2; exit 1; }
+bash -n "$CL" && bash -n "$CX"
+
+set +e
+"$TO" 1 -- /bin/sleep 5 >/dev/null 2>"$ERR"
+rc=$?
+set -e
+if [[ $rc -eq 124 ]]; then
+  ok "timeout 1s on sleep 5 → 124"
+else
+  bad "timeout rc=$rc (want 124)"
+fi
+
+set +e
+"$TO" nan -- /bin/echo hi >/dev/null 2>"$ERR"
+rc=$?
+set -e
+if [[ $rc -eq 2 ]]; then
+  ok "nan timeout rejected"
+else
+  bad "nan rc=$rc (want 2)"
+fi
+
+child_of() {
+  local parent="$1"
+  ps -axo pid=,ppid= | awk -v parent="$parent" '$2 == parent { print $1; exit }'
+}
+
+# Parent bash does not exec the helper. SIGKILL the bash so it cannot
+# forward signals; the helper must reap its exact child via ppid polling.
+# `; exit` keeps bash as parent (bash -c otherwise execs a single command).
+bash -c '"$1" 30 -- /bin/sleep 31; exit' x "$TO" &
+bp=$!
+sleep 0.4
+hpid="$(child_of "$bp" || true)"
+spid=""
+[[ -z "$hpid" ]] || spid="$(child_of "$hpid" || true)"
+if ! kill -0 "$bp" 2>/dev/null; then
+  bad "parent bash exited before kill"
+elif [[ -z "$spid" ]]; then
+  kill -KILL "$bp" 2>/dev/null || true
+  wait "$bp" 2>/dev/null || true
+  bad "could not find timeout child"
+else
+  kill -KILL "$bp" 2>/dev/null || true
+  wait "$bp" 2>/dev/null || true
+  sleep 5
+  if kill -0 "$spid" 2>/dev/null; then
+    bad "timeout child (pid $spid) still running after parent SIGKILL"
+    kill -KILL "$spid" 2>/dev/null || true
+  else
+    ok "parent death reaped sleep child"
+  fi
+fi
+
+# The session leader exits on SIGINT while its child ignores SIGINT/SIGTERM.
+# Escalation must continue until the entire process group is gone.
+"$TO" 1 -- python3 -c '
+import signal
+import subprocess
+import sys
+import time
+
+subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+])
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+time.sleep(30)
+' >/dev/null 2>"$ERR" &
+tp=$!
+sleep 0.4
+leader_pid="$(child_of "$tp" || true)"
+leaf_pid=""
+[[ -z "$leader_pid" ]] || leaf_pid="$(child_of "$leader_pid" || true)"
+set +e
+wait "$tp"
+rc=$?
+set -e
+if [[ $rc -ne 124 ]]; then
+  bad "process-group timeout rc=$rc (want 124)"
+elif [[ -z "$leaf_pid" ]]; then
+  bad "could not find process-group probe child"
+elif kill -0 "$leaf_pid" 2>/dev/null; then
+  bad "process-group child (pid $leaf_pid) survived escalation"
+  kill -KILL "$leaf_pid" 2>/dev/null || true
+else
+  ok "timeout reaped full process group"
+fi
+
+# Session leader exits 0 while a child remains. Reap the group; keep rc 0.
+export LEAF_PID_FILE="$TEST_TMP/leaf.pid"
+set +e
+"$TO" 10 -- python3 -c '
+import os
+import subprocess
+import sys
+
+p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
+open(os.environ["LEAF_PID_FILE"], "w").write(str(p.pid))
+raise SystemExit(0)
+' >/dev/null 2>"$ERR"
+rc=$?
+set -e
+unset LEAF_PID_FILE
+leaf_pid="$(cat "$TEST_TMP/leaf.pid" 2>/dev/null || true)"
+if [[ $rc -ne 0 ]]; then
+  bad "leader-exit leftover rc=$rc (want 0)"
+elif [[ -z "$leaf_pid" ]]; then
+  bad "leader-exit leftover did not record child pid"
+elif kill -0 "$leaf_pid" 2>/dev/null; then
+  bad "leader-exit leftover (pid $leaf_pid) survived"
+  kill -KILL "$leaf_pid" 2>/dev/null || true
+else
+  ok "leader exit reaped leftover process group"
+fi
+
+# A timed-out Codex run must preserve a completed answer while returning 124.
+mkdir -p "$TEST_TMP/bin"
+cat >"$TEST_TMP/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+last=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    last="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+cat >/dev/null
+printf 'answer before timeout\n' >"$last"
+/bin/sleep 30
+EOF
+chmod +x "$TEST_TMP/bin/codex"
+set +e
+answer="$(PATH="$TEST_TMP/bin:$PATH" "$CX" --mode opinion --timeout 1 --stdin <<<"test" 2>"$ERR")"
+rc=$?
+set -e
+if [[ $rc -eq 124 && "$answer" == "answer before timeout" ]]; then
+  ok "codex timeout preserved answer and returned 124"
+else
+  bad "codex timeout rc=$rc answer=$(printf %q "$answer")"
+fi
+
+expect2() {
+  local label="$1"
+  shift
+  set +e
+  "$@" >/dev/null 2>"$ERR"
+  rc=$?
+  set -e
+  if [[ $rc -eq 2 ]]; then
+    ok "$label"
+  else
+    bad "$label rc=$rc (want 2) $(head -c 200 "$ERR")"
+  fi
+}
+
+expect2_stdin() {
+  local label="$1"
+  local input="$2"
+  shift 2
+  set +e
+  "$@" <<<"$input" >/dev/null 2>"$ERR"
+  rc=$?
+  set -e
+  if [[ $rc -eq 2 ]]; then
+    ok "$label"
+  else
+    bad "$label rc=$rc (want 2) $(head -c 200 "$ERR")"
+  fi
+}
+
+expect2 "claude refuses --bare" "$CL" --bare --mode opinion -- x
+expect2_stdin "claude refuses \$HOME cwd" x "$CL" --mode opinion --cwd "$HOME" --stdin
+expect2_stdin "claude refuses ~/.grok cwd" x "$CL" --mode opinion --cwd "$HOME/.grok" --stdin
+expect2_stdin "claude empty prompt" "" "$CL" --mode opinion --stdin
+expect2_stdin "claude review empty prompt" "" "$CL" --mode review --cwd "$TEST_TMP" --stdin
+expect2 "claude argv prompt removed" "$CL" --mode opinion -- x
+expect2_stdin "claude review needs cwd" x "$CL" --mode review --stdin
+expect2 "claude raw removed" "$CL" --mode raw
+expect2 "claude --json-full removed" "$CL" --mode opinion --json-full -- x
+expect2 "claude --no-timeout removed" "$CL" --mode opinion --no-timeout -- x
+expect2 "claude --permission-mode removed" "$CL" --mode opinion --permission-mode auto -- x
+expect2_stdin "codex refuses \$HOME cwd" x "$CX" --mode read --cwd "$HOME" --stdin
+expect2_stdin "codex refuses ~/.grok cwd" x "$CX" --mode read --cwd "$HOME/.grok" --stdin
+expect2_stdin "codex review needs cwd" x "$CX" --mode review --stdin
+expect2 "codex review target needs review mode" "$CX" --mode read --base main
+expect2 "codex review title needs review mode" "$CX" --mode implement --title test
+expect2 "codex argv prompt removed" "$CX" --mode opinion -- x
+expect2 "codex raw removed" "$CX" --mode raw
+expect2 "codex --json removed" "$CX" --mode opinion --json -- "x"
+expect2 "codex --add-dir removed" "$CX" --mode opinion --add-dir /tmp -- "x"
+expect2 "codex --skip-git-check removed" "$CX" --mode opinion --skip-git-check -- "x"
+expect2 "codex --no-timeout removed" "$CX" --mode opinion --no-timeout -- "x"
+
+if [[ $fail -ne 0 ]]; then
+  echo "consult-selftest: FAILED" >&2
+  exit 1
+fi
+echo "consult-selftest: ok"

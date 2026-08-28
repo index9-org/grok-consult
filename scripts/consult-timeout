@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Run a command in a new process group. Escalate SIGINT → SIGTERM → SIGKILL.
+
+Usage: consult-timeout <seconds> -- <command> [args...]
+
+Exit 124 on timeout (GNU timeout convention). Otherwise the child's exit code.
+Stdin/stdout/stderr pass through. SIGINT first so Claude Code can end the turn.
+
+The child is in its own session so a timeout does not kill Grok. Forward
+SIGINT/SIGTERM/SIGHUP to that session, and kill it if this process's parent
+dies. SIGKILL of this helper still cannot be caught.
+"""
+from __future__ import annotations
+
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+SIGINT_GRACE = 2.0
+SIGTERM_GRACE = 2.0
+WATCH_INTERVAL = 0.2
+
+# Written only from the signal handler (main thread in CPython). Main loop reads it.
+got_signal = 0
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"consult-timeout: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def parse_args(argv: list[str]) -> tuple[float | None, list[str]]:
+    if not argv:
+        die("usage: consult-timeout <seconds>|0 -- <command> [args...]")
+    if argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        raise SystemExit(0)
+    try:
+        secs = float(argv[0])
+    except ValueError:
+        die("first argument must be timeout seconds (0 disables)")
+    if not math.isfinite(secs) or secs < 0:
+        die("timeout seconds must be a finite number >= 0")
+    rest = argv[1:]
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    if not rest:
+        die("missing command after timeout seconds")
+    return (None if secs == 0 else secs, rest)
+
+
+def signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError as e:
+        print(f"consult-timeout: killpg({pid}, {sig}) failed: {e}", file=sys.stderr)
+
+
+def group_exists(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_group_exit(proc: subprocess.Popen[bytes], deadline: float) -> bool:
+    while True:
+        proc.poll()  # Reap the session leader without treating its exit as tree exit.
+        if not group_exists(proc.pid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, WATCH_INTERVAL))
+
+
+def child_exit_code(rc: int | None) -> int:
+    if rc is None:
+        return 1
+    if rc < 0:
+        return 128 + (-rc)
+    return rc
+
+
+def escalate_kill(proc: subprocess.Popen[bytes], why: str) -> None:
+    print(f"consult-timeout: {why} — sending SIGINT", file=sys.stderr)
+    signal_group(proc.pid, signal.SIGINT)
+    if wait_group_exit(proc, time.monotonic() + SIGINT_GRACE):
+        return
+    print("consult-timeout: SIGINT ignored — sending SIGTERM", file=sys.stderr)
+    signal_group(proc.pid, signal.SIGTERM)
+    if wait_group_exit(proc, time.monotonic() + SIGTERM_GRACE):
+        return
+    print("consult-timeout: SIGTERM ignored — sending SIGKILL", file=sys.stderr)
+    signal_group(proc.pid, signal.SIGKILL)
+    wait_group_exit(proc, time.monotonic() + 2)
+
+
+def reap_remaining_group(proc: subprocess.Popen[bytes]) -> None:
+    """Leader exited; kill any session members that outlived it. Keep the leader's rc."""
+    if not group_exists(proc.pid):
+        return
+    print(
+        "consult-timeout: session leader exited — reaping remaining process group",
+        file=sys.stderr,
+    )
+    signal_group(proc.pid, signal.SIGTERM)
+    if wait_group_exit(proc, time.monotonic() + SIGTERM_GRACE):
+        return
+    print("consult-timeout: SIGTERM ignored — sending SIGKILL", file=sys.stderr)
+    signal_group(proc.pid, signal.SIGKILL)
+    wait_group_exit(proc, time.monotonic() + 2)
+
+
+def note_signal(signum: int, _frame: object | None) -> None:
+    global got_signal
+    if got_signal == 0:
+        got_signal = signum
+
+
+def main() -> None:
+    timeout_secs, cmd = parse_args(sys.argv[1:])
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, note_signal)
+
+    parent_pid = os.getppid()
+    if got_signal:
+        raise SystemExit(128 + got_signal)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            start_new_session=True,
+        )
+    except FileNotFoundError as e:
+        die(f"command not found: {e.filename or cmd[0]}")
+    except OSError as e:
+        die(f"failed to start {cmd[0]}: {e}")
+
+    deadline = None if timeout_secs is None else time.monotonic() + timeout_secs
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            reap_remaining_group(proc)
+            raise SystemExit(child_exit_code(rc))
+        if got_signal:
+            try:
+                name = signal.Signals(got_signal).name
+            except ValueError:
+                name = str(got_signal)
+            escalate_kill(proc, f"received {name}")
+            raise SystemExit(128 + got_signal)
+        try:
+            if os.getppid() != parent_pid:
+                escalate_kill(proc, "parent process died")
+                raise SystemExit(143)
+        except OSError:
+            escalate_kill(proc, "parent process died")
+            raise SystemExit(143)
+        if deadline is not None and time.monotonic() >= deadline:
+            escalate_kill(proc, f"timed out after {int(timeout_secs or 0)}s")
+            raise SystemExit(124)
+        try:
+            proc.wait(timeout=WATCH_INTERVAL)
+            reap_remaining_group(proc)
+            raise SystemExit(child_exit_code(proc.returncode))
+        except subprocess.TimeoutExpired:
+            continue
+
+
+if __name__ == "__main__":
+    main()

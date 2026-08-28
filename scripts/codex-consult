@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# codex-consult — consult Codex CLI (ChatGPT login) from Grok or a shell.
+# Brain-first opinion, sandbox write locks, ephemeral one-shots.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TIMEOUT_BIN="$SCRIPT_DIR/consult-timeout"
+DEFAULT_MODEL="gpt-5.6-sol"
+
+usage() {
+  cat <<'EOF'
+Usage: codex-consult --mode <mode> --stdin [options] < prompt.txt
+
+Modes (model default: gpt-5.6-sol):
+  opinion    plan/design critique     — read-only, temp cwd if unset
+  review     git review               — read-only, requires --cwd
+  read       codebase question        — read-only, requires --cwd
+  implement  make changes             — workspace-write, requires --cwd
+
+Options:
+  --model <id>              default: gpt-5.6-sol
+  --effort <level>          low|medium|high|xhigh|max
+  --cwd <dir>               required for review|read|implement
+  --uncommitted             review target (default if no --base/--commit)
+  --base <branch>           review vs base (exclusive)
+  --commit <sha>            review one commit (exclusive)
+  --title <title>           review summary title
+  --timeout <secs>          hard kill (default: 900)
+  --stdin                   read prompt from stdin
+  -h, --help
+
+Approvals always: approval_policy=never. Prompt on stdin via `codex exec -`.
+Grok: shell timeout ≥ 960000 ms. Opinion uses --ignore-user-config (auth stays).
+EOF
+}
+
+die() {
+  echo "codex-consult: $*" >&2
+  exit 2
+}
+
+log() {
+  echo "codex-consult: $*" >&2
+}
+
+is_pos_int() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+resolve_abs() {
+  (cd "$1" && pwd -P)
+}
+
+unset_secrets() {
+  unset OPENAI_API_KEY CODEX_API_KEY \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+    GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN \
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+    GOOGLE_APPLICATION_CREDENTIALS \
+    DATABASE_URL REDIS_URL \
+    NPM_TOKEN NODE_AUTH_TOKEN \
+    STRIPE_SECRET_KEY STRIPE_API_KEY \
+    2>/dev/null || true
+}
+
+assert_cwd_allowed() {
+  local p="$1"
+  if [[ "$p" == "$home_grok" || "$p" == "$home_grok"/* ]]; then
+    die "refusing cwd under ~/.grok ($p); use a project repo or omit --cwd for opinion"
+  fi
+  if [[ "$p" == "$home_abs" ]]; then
+    die "refusing cwd \$HOME ($p); use a project repo or omit --cwd for opinion"
+  fi
+}
+
+MODE=""
+MODEL="$DEFAULT_MODEL"
+EFFORT=""
+EFFORT_SET=0
+CWD=""
+REVIEW_TARGET="uncommitted"
+REVIEW_VALUE=""
+REVIEW_TARGET_SET=0
+REVIEW_TITLE=""
+TIMEOUT_SECS=900
+USE_STDIN=0
+OPINION_TMP=""
+WORKDIR=""
+
+set_review_target() {
+  local kind="$1"
+  local val="${2:-}"
+  if [[ "$REVIEW_TARGET_SET" -eq 1 ]]; then
+    die "conflicting review targets (use only one of --uncommitted / --base / --commit)"
+  fi
+  REVIEW_TARGET_SET=1
+  REVIEW_TARGET="$kind"
+  REVIEW_VALUE="$val"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --mode)
+      [[ $# -ge 2 ]] || die "--mode requires a value"
+      MODE="$2"; shift 2 ;;
+    --model)
+      [[ $# -ge 2 ]] || die "--model requires a value"
+      MODEL="$2"; shift 2 ;;
+    --effort)
+      [[ $# -ge 2 ]] || die "--effort requires a value"
+      EFFORT="$2"; EFFORT_SET=1; shift 2 ;;
+    --cwd)
+      [[ $# -ge 2 ]] || die "--cwd requires a value"
+      CWD="$2"; shift 2 ;;
+    --uncommitted)
+      set_review_target uncommitted
+      shift ;;
+    --base)
+      [[ $# -ge 2 ]] || die "--base requires a value"
+      set_review_target base "$2"
+      shift 2 ;;
+    --commit)
+      [[ $# -ge 2 ]] || die "--commit requires a value"
+      set_review_target commit "$2"
+      shift 2 ;;
+    --title)
+      [[ $# -ge 2 ]] || die "--title requires a value"
+      REVIEW_TITLE="$2"; shift 2 ;;
+    --timeout)
+      [[ $# -ge 2 ]] || die "--timeout requires a value"
+      TIMEOUT_SECS="$2"; shift 2 ;;
+    --stdin)
+      USE_STDIN=1; shift ;;
+    --extra|--allow-writes|--full-access|--i-mean-full-access|--add-dir|--json|--structured|--no-structured|--persist|--approval|--sandbox|--no-timeout|--skip-git-check)
+      die "$1 removed (see --help)" ;;
+    --) die "prompt arguments removed; use --stdin" ;;
+    -*)
+      die "unknown option: $1 (use --help)" ;;
+    *) die "prompt arguments removed; use --stdin" ;;
+  esac
+done
+
+[[ -n "$MODE" ]] || die "required: --mode opinion|review|read|implement"
+case "$MODE" in
+  opinion|review|read|implement) ;;
+  raw) die "mode=raw removed; use implement or call codex directly" ;;
+  *) die "unknown mode: $MODE" ;;
+esac
+
+if [[ "$MODE" != "review" && ( "$REVIEW_TARGET_SET" -eq 1 || -n "$REVIEW_TITLE" ) ]]; then
+  die "--uncommitted/--base/--commit/--title require --mode review"
+fi
+
+if [[ "$EFFORT_SET" -eq 1 ]]; then
+  case "$EFFORT" in
+    low|medium|high|xhigh|max) ;;
+    *) die "invalid --effort: $EFFORT (low|medium|high|xhigh|max)" ;;
+  esac
+else
+  case "$MODE" in
+    read) EFFORT="medium" ;;
+    *) EFFORT="high" ;;
+  esac
+fi
+
+is_pos_int "$TIMEOUT_SECS" || die "--timeout must be a positive integer"
+
+[[ "$USE_STDIN" -eq 1 ]] || die "required: --stdin"
+PROMPT="$(cat)"
+PROMPT="${PROMPT#"${PROMPT%%[![:space:]]*}"}"
+PROMPT="${PROMPT%"${PROMPT##*[![:space:]]}"}"
+
+if [[ -z "$PROMPT" && "$MODE" != "review" ]]; then
+  die "empty prompt on stdin"
+fi
+
+case "$MODE" in
+  implement) SANDBOX="workspace-write" ;;
+  *) SANDBOX="read-only" ;;
+esac
+
+command -v codex >/dev/null 2>&1 || die "codex not found on PATH"
+[[ -x "$TIMEOUT_BIN" ]] || die "missing timeout helper: $TIMEOUT_BIN"
+unset_secrets
+
+home_grok="$(resolve_abs "$HOME/.grok" 2>/dev/null || echo "$HOME/.grok")"
+home_abs="$(resolve_abs "$HOME" 2>/dev/null || echo "$HOME")"
+
+cleanup() {
+  rm -rf ${WORKDIR:+"$WORKDIR"} ${OPINION_TMP:+"$OPINION_TMP"}
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+SKIP_GIT=0
+if [[ "$MODE" == "opinion" ]]; then
+  if [[ -z "$CWD" ]]; then
+    OPINION_TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-consult.XXXXXX")"
+    CWD="$OPINION_TMP"
+    SKIP_GIT=1
+  fi
+else
+  [[ -n "$CWD" ]] || die "--cwd is required for mode=$MODE"
+fi
+
+[[ -d "$CWD" ]] || die "cwd is not a directory: $CWD"
+CWD="$(resolve_abs "$CWD")"
+assert_cwd_allowed "$CWD"
+
+if [[ "$MODE" == "review" ]]; then
+  if ! git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    die "review requires a git worktree at --cwd ($CWD)"
+  fi
+  CWD="$(git -C "$CWD" rev-parse --show-toplevel)"
+  CWD="$(resolve_abs "$CWD")"
+  assert_cwd_allowed "$CWD"
+fi
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-consult-run.XXXXXX")"
+LAST_MSG="$WORKDIR/last.txt"
+CODEX_STDOUT="$WORKDIR/codex-stdout.txt"
+CODEX_STDERR="$WORKDIR/codex-stderr.txt"
+
+FRAME=""
+case "$MODE" in
+  opinion)
+    FRAME="You are a second-opinion consultant for Grok Build. Critique from the provided text. Be concrete about risks and missing steps. Do not modify files."
+    ;;
+  review)
+    FRAME="You are reviewing code changes for Grok Build. Severity-ordered findings with evidence. Do not modify files."
+    ;;
+  read)
+    FRAME="You are answering a codebase question for Grok Build. Cite paths and symbols. Do not modify files."
+    ;;
+  implement)
+    FRAME="You may implement the requested change. Keep scope tight and summarize what you changed."
+    ;;
+esac
+
+FULL_PROMPT="$FRAME"
+if [[ -n "$PROMPT" ]]; then
+  FULL_PROMPT+=$'\n\n'"$PROMPT"
+fi
+
+print_answer_file() {
+  local path="$1"
+  cat "$path"
+  [[ "$(tail -c1 "$path" | wc -l)" -eq 0 ]] && echo || true
+}
+
+ARGS=(
+  exec
+  --color never
+  -o "$LAST_MSG"
+  -s "$SANDBOX"
+  -m "$MODEL"
+  -C "$CWD"
+  -c "approval_policy=\"never\""
+  -c "model_reasoning_effort=\"$EFFORT\""
+  --ephemeral
+)
+
+if [[ "$MODE" == "opinion" ]]; then
+  ARGS+=(--ignore-user-config)
+  if [[ "$SKIP_GIT" -eq 1 ]]; then
+    ARGS+=(--skip-git-repo-check)
+  fi
+fi
+
+if [[ "$MODE" == "review" ]]; then
+  ARGS+=(review)
+  case "$REVIEW_TARGET" in
+    commit) ARGS+=(--commit "$REVIEW_VALUE") ;;
+    base) ARGS+=(--base "$REVIEW_VALUE") ;;
+    uncommitted) ARGS+=(--uncommitted) ;;
+  esac
+  if [[ -n "$REVIEW_TITLE" ]]; then
+    ARGS+=(--title "$REVIEW_TITLE")
+  fi
+fi
+
+ARGS+=(-)
+
+log "mode=$MODE model=$MODEL effort=$EFFORT sandbox=$SANDBOX cwd=$CWD"
+
+set +e
+"$TIMEOUT_BIN" "$TIMEOUT_SECS" -- codex "${ARGS[@]}" <<<"$FULL_PROMPT" >"$CODEX_STDOUT" 2>"$CODEX_STDERR"
+RC=$?
+set -e
+
+if [[ $RC -eq 124 ]]; then
+  if [[ -s "$LAST_MSG" ]]; then
+    print_answer_file "$LAST_MSG"
+  elif [[ -s "$CODEX_STDOUT" ]]; then
+    cat "$CODEX_STDOUT"
+  fi
+  log "timed out after ${TIMEOUT_SECS}s"
+  [[ -s "$CODEX_STDERR" ]] && tail -c 4000 "$CODEX_STDERR" >&2
+  exit 124
+fi
+
+if [[ -s "$LAST_MSG" ]]; then
+  print_answer_file "$LAST_MSG"
+  exit 0
+fi
+
+if [[ $RC -ne 0 ]]; then
+  log "codex exit=$RC (no last-message file)"
+  [[ -s "$CODEX_STDERR" ]] && tail -c 8000 "$CODEX_STDERR" >&2
+  if [[ -s "$CODEX_STDOUT" ]]; then
+    cat "$CODEX_STDOUT"
+    exit 0
+  fi
+  exit "$RC"
+fi
+
+log "warning: no last-message file from codex (exit=$RC)"
+if [[ -s "$CODEX_STDOUT" ]]; then
+  cat "$CODEX_STDOUT"
+  exit 0
+fi
+exit 1

@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# claude-consult — consult Claude Code CLI (Max OAuth) from Grok or a shell.
+# Never uses --bare. Default model: opus.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TIMEOUT_BIN="$SCRIPT_DIR/consult-timeout"
+
+usage() {
+  cat <<'EOF'
+Usage: claude-consult --mode <mode> --stdin [options] < prompt.txt
+
+Modes (default model: opus):
+  opinion    plan/design critique   — --safe-mode --tools ""
+  review     repo/diff review       — --safe-mode, Read/Glob/Grep only
+  read       codebase question      — --safe-mode, Read/Glob/Grep only
+  implement  make the change        — --safe-mode, default tools, writes ok
+
+Options:
+  --model <id>              sonnet | opus | fable | full id (default: opus)
+  --effort <level>          low | medium | high | xhigh | max
+  --budget <usd>            optional spend cap (off by default)
+  --cwd <dir>               real project repo (required for review|read|implement)
+  --timeout <secs>          hard kill (default: 900)
+  --stdin                   read prompt from stdin
+  -h, --help
+
+Prompt body is piped on stdin. Never --bare. Grok: shell timeout ≥ 960000 ms.
+EOF
+}
+
+die() {
+  echo "claude-consult: $*" >&2
+  exit 2
+}
+
+log() {
+  echo "claude-consult: $*" >&2
+}
+
+is_pos_int() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+resolve_abs() {
+  (cd "$1" && pwd -P)
+}
+
+unset_secrets() {
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+    OPENAI_API_KEY CODEX_API_KEY \
+    GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN \
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+    GOOGLE_APPLICATION_CREDENTIALS \
+    DATABASE_URL REDIS_URL \
+    NPM_TOKEN NODE_AUTH_TOKEN \
+    STRIPE_SECRET_KEY STRIPE_API_KEY \
+    2>/dev/null || true
+}
+
+assert_cwd_allowed() {
+  local p="$1"
+  if [[ "$p" == "$home_grok" || "$p" == "$home_grok"/* ]]; then
+    die "refusing cwd under ~/.grok ($p); use a project repo or omit --cwd for opinion"
+  fi
+  if [[ "$p" == "$home_abs" ]]; then
+    die "refusing cwd \$HOME ($p); use a project repo or omit --cwd for opinion"
+  fi
+}
+
+MODE=""
+MODEL="opus"
+EFFORT=""
+EFFORT_SET=0
+BUDGET=""
+CWD=""
+TIMEOUT_SECS=900
+USE_STDIN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --mode)
+      [[ $# -ge 2 ]] || die "--mode requires a value"
+      MODE="$2"; shift 2 ;;
+    --model)
+      [[ $# -ge 2 ]] || die "--model requires a value"
+      MODEL="$2"; shift 2 ;;
+    --effort)
+      [[ $# -ge 2 ]] || die "--effort requires a value"
+      EFFORT="$2"; EFFORT_SET=1; shift 2 ;;
+    --budget)
+      [[ $# -ge 2 ]] || die "--budget requires a value"
+      BUDGET="$2"; shift 2 ;;
+    --cwd)
+      [[ $# -ge 2 ]] || die "--cwd requires a value"
+      CWD="$2"; shift 2 ;;
+    --timeout)
+      [[ $# -ge 2 ]] || die "--timeout requires a value"
+      TIMEOUT_SECS="$2"; shift 2 ;;
+    --stdin)
+      USE_STDIN=1; shift ;;
+    --extra|--bare|--allow-writes|--full-harness|--with-tools|--structured|--no-structured|--persist|--continue|--resume|--raw-text|--no-budget|--fallback|--json-full|--no-timeout|--permission-mode)
+      die "$1 removed (see --help)" ;;
+    --) die "prompt arguments removed; use --stdin" ;;
+    -*)
+      die "unknown option: $1 (use --help)" ;;
+    *) die "prompt arguments removed; use --stdin" ;;
+  esac
+done
+
+[[ -n "$MODE" ]] || die "required: --mode opinion|review|read|implement"
+case "$MODE" in
+  opinion|review|read|implement) ;;
+  raw) die "mode=raw removed; use implement or call claude directly" ;;
+  *) die "unknown mode: $MODE" ;;
+esac
+
+is_pos_int "$TIMEOUT_SECS" || die "--timeout must be a positive integer"
+
+if [[ "$EFFORT_SET" -eq 0 ]]; then
+  case "$MODE" in
+    read) EFFORT="medium" ;;
+    *) EFFORT="high" ;;
+  esac
+fi
+
+APPEND=""
+case "$MODE" in
+  opinion)
+    APPEND="You are a second-opinion consultant (brain-only) invoked from Grok Build. Critique from the text provided. Do not modify files."
+    ;;
+  review)
+    APPEND="You are reviewing work for Grok Build. Severity-ordered findings with file evidence. Prefer the provided text; Read/Glob/Grep only. Do not modify files."
+    ;;
+  read)
+    APPEND="You are answering a codebase question for Grok Build. Cite paths and symbols. Read/Glob/Grep only. Do not modify files."
+    ;;
+  implement)
+    APPEND="You may implement the requested change. Keep scope tight, match project conventions, and summarize what you changed."
+    ;;
+esac
+
+[[ "$USE_STDIN" -eq 1 ]] || die "required: --stdin"
+PROMPT="$(cat)"
+PROMPT="${PROMPT#"${PROMPT%%[![:space:]]*}"}"
+PROMPT="${PROMPT%"${PROMPT##*[![:space:]]}"}"
+[[ -n "$PROMPT" ]] || die "empty prompt on stdin (empty diff — nothing to review?)"
+
+command -v claude >/dev/null 2>&1 || die "claude not found on PATH"
+[[ -x "$TIMEOUT_BIN" ]] || die "missing timeout helper: $TIMEOUT_BIN"
+unset_secrets
+
+home_grok="$(resolve_abs "$HOME/.grok" 2>/dev/null || echo "$HOME/.grok")"
+home_abs="$(resolve_abs "$HOME" 2>/dev/null || echo "$HOME")"
+OPINION_TMP=""
+
+cleanup() {
+  rm -rf ${OPINION_TMP:+"$OPINION_TMP"}
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+if [[ -z "$CWD" ]]; then
+  case "$MODE" in
+    opinion)
+      OPINION_TMP="$(mktemp -d "${TMPDIR:-/tmp}/claude-consult.cwd.XXXXXX")"
+      CWD="$OPINION_TMP"
+      ;;
+    *) die "--cwd is required for mode=$MODE" ;;
+  esac
+fi
+
+[[ -d "$CWD" ]] || die "cwd is not a directory: $CWD"
+CWD="$(resolve_abs "$CWD")"
+assert_cwd_allowed "$CWD"
+cd "$CWD"
+
+ARGS=(
+  -p
+  --model "$MODEL"
+  --permission-mode auto
+  --safe-mode
+  --no-session-persistence
+  --effort "$EFFORT"
+  --append-system-prompt "$APPEND"
+)
+
+case "$MODE" in
+  opinion) ARGS+=(--tools "") ;;
+  review|read) ARGS+=(--tools "Read,Glob,Grep") ;;
+esac
+
+if [[ -n "$BUDGET" ]]; then
+  ARGS+=(--max-budget-usd "$BUDGET")
+fi
+
+log "mode=$MODE model=$MODEL effort=$EFFORT cwd=$CWD"
+
+set +e
+"$TIMEOUT_BIN" "$TIMEOUT_SECS" -- claude "${ARGS[@]}" <<<"$PROMPT"
+RC=$?
+set -e
+
+if [[ $RC -eq 124 ]]; then
+  log "timed out after ${TIMEOUT_SECS}s"
+  exit 124
+fi
+exit "$RC"

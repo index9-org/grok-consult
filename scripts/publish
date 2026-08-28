@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# publish — validate, then tag v<plugin.json version> and push.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+"$ROOT/scripts/validate"
+
+if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "publish: not a git repository" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+  echo "publish: working tree is dirty; commit first" >&2
+  exit 1
+fi
+if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+  echo "publish: no origin remote. Create one, then retry:" >&2
+  echo "  gh repo create johnwils/grok-consult --public --source=. --remote=origin --push" >&2
+  exit 1
+fi
+
+grok plugin tag "$ROOT" --push

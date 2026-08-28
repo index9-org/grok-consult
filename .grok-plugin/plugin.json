@@ -1,0 +1,13 @@
+{
+  "name": "consult",
+  "version": "0.1.0",
+  "description": "Consult local Claude Code (Pro or Max) and/or Codex CLI (ChatGPT) from Grok Build. Never auto-invoke.",
+  "author": {
+    "name": "John Wilson",
+    "url": "https://github.com/johnwils"
+  },
+  "repository": "https://github.com/johnwils/grok-consult",
+  "homepage": "https://github.com/johnwils/grok-consult",
+  "license": "MIT",
+  "keywords": ["claude", "codex", "grok", "consult"]
+}

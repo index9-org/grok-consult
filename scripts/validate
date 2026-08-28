@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# validate — grok plugin manifest + wrapper selftest (no live model calls).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+command -v grok >/dev/null 2>&1 || { echo "validate: grok not found on PATH" >&2; exit 1; }
+grok plugin validate "$ROOT"
+"$ROOT/scripts/consult-selftest"
