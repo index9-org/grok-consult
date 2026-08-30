@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# cursor-consult — consult Cursor Agent CLI from Grok or a shell.
+# Print mode + ask for read-only; --force only for implement. Prompt on stdin.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TIMEOUT_BIN="$SCRIPT_DIR/consult-timeout"
+
+usage() {
+  cat <<'EOF'
+Usage: cursor-consult --mode <mode> --stdin [options] < prompt.txt
+
+Modes (default model: Cursor CLI selected model):
+  opinion    plan/design critique     — --mode ask, sandbox on, no --force
+  review     repo/diff review         — --mode ask, sandbox on, no --force
+  read       codebase question        — --mode ask, sandbox on, no --force
+  implement  make the change          — agent mode, --force, sandbox omitted
+
+Options:
+  --model <id>              Cursor model id or bracket form
+                            (e.g. composer-2.5, claude-opus-5-thinking-high,
+                            'grok-4.6[effort=high]'). Default: omit (CLI picker)
+  --cwd <dir>               real project repo (required for review|read|implement)
+  --timeout <secs>          hard kill (default: 900)
+  --stdin                   read prompt from stdin
+  -h, --help
+
+Prompt body is piped on stdin. Binary is cursor-agent, not cursor.
+Grok: shell timeout ≥ 960000 ms.
+EOF
+}
+
+die() {
+  echo "cursor-consult: $*" >&2
+  exit 2
+}
+
+log() {
+  echo "cursor-consult: $*" >&2
+}
+
+is_pos_int() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+resolve_abs() {
+  (cd "$1" && pwd -P)
+}
+
+unset_secrets() {
+  unset CURSOR_API_KEY \
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+    OPENAI_API_KEY CODEX_API_KEY \
+    GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN \
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+    GOOGLE_APPLICATION_CREDENTIALS \
+    DATABASE_URL REDIS_URL \
+    NPM_TOKEN NODE_AUTH_TOKEN \
+    STRIPE_SECRET_KEY STRIPE_API_KEY \
+    2>/dev/null || true
+}
+
+assert_cwd_allowed() {
+  local p="$1"
+  if [[ "$p" == "$home_grok" || "$p" == "$home_grok"/* ]]; then
+    die "refusing cwd under ~/.grok ($p); use a project repo or omit --cwd for opinion"
+  fi
+  if [[ "$p" == "$home_abs" ]]; then
+    die "refusing cwd \$HOME ($p); use a project repo or omit --cwd for opinion"
+  fi
+}
+
+assert_logged_in() {
+  local auth
+  auth="$(cursor-agent status --format json 2>/dev/null || true)"
+  if [[ "$auth" == *'"isAuthenticated": true'* ]]; then
+    return 0
+  fi
+  if cursor-agent status >/dev/null 2>&1; then
+    return 0
+  fi
+  die "not logged in; run: cursor-agent login"
+}
+
+MODE=""
+MODEL=""
+CWD=""
+TIMEOUT_SECS=900
+USE_STDIN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --mode)
+      [[ $# -ge 2 ]] || die "--mode requires a value"
+      MODE="$2"; shift 2 ;;
+    --model)
+      [[ $# -ge 2 ]] || die "--model requires a value"
+      MODEL="$2"; shift 2 ;;
+    --cwd)
+      [[ $# -ge 2 ]] || die "--cwd requires a value"
+      CWD="$2"; shift 2 ;;
+    --timeout)
+      [[ $# -ge 2 ]] || die "--timeout requires a value"
+      TIMEOUT_SECS="$2"; shift 2 ;;
+    --stdin)
+      USE_STDIN=1; shift ;;
+    --effort)
+      die "--effort is not a Cursor flag; put effort in --model (e.g. claude-opus-5-thinking-high or 'grok-4.6[effort=high]')" ;;
+    --force|--yolo|--print|--approve-mcps|--resume|--continue|--cloud|--bare|--extra|--allow-writes|--json|--structured|--no-structured|--persist|--no-timeout)
+      die "$1 removed (see --help)" ;;
+    --) die "prompt arguments removed; use --stdin" ;;
+    -*)
+      die "unknown option: $1 (use --help)" ;;
+    *) die "prompt arguments removed; use --stdin" ;;
+  esac
+done
+
+[[ -n "$MODE" ]] || die "required: --mode opinion|review|read|implement"
+case "$MODE" in
+  opinion|review|read|implement) ;;
+  raw) die "mode=raw removed; use implement or call cursor-agent directly" ;;
+  *) die "unknown mode: $MODE" ;;
+esac
+
+is_pos_int "$TIMEOUT_SECS" || die "--timeout must be a positive integer"
+
+[[ "$USE_STDIN" -eq 1 ]] || die "required: --stdin"
+PROMPT="$(cat)"
+PROMPT="${PROMPT#"${PROMPT%%[![:space:]]*}"}"
+PROMPT="${PROMPT%"${PROMPT##*[![:space:]]}"}"
+[[ -n "$PROMPT" ]] || die "empty prompt on stdin (empty diff — nothing to review?)"
+
+command -v cursor-agent >/dev/null 2>&1 || die "cursor-agent not found on PATH (not the editor binary named cursor)"
+[[ -x "$TIMEOUT_BIN" ]] || die "missing timeout helper: $TIMEOUT_BIN"
+unset_secrets
+assert_logged_in
+
+home_grok="$(resolve_abs "$HOME/.grok" 2>/dev/null || echo "$HOME/.grok")"
+home_abs="$(resolve_abs "$HOME" 2>/dev/null || echo "$HOME")"
+OPINION_TMP=""
+WORKDIR=""
+
+cleanup() {
+  rm -rf ${WORKDIR:+"$WORKDIR"} ${OPINION_TMP:+"$OPINION_TMP"}
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+if [[ -z "$CWD" ]]; then
+  case "$MODE" in
+    opinion)
+      OPINION_TMP="$(mktemp -d "${TMPDIR:-/tmp}/cursor-consult.cwd.XXXXXX")"
+      CWD="$OPINION_TMP"
+      ;;
+    *) die "--cwd is required for mode=$MODE" ;;
+  esac
+fi
+
+[[ -d "$CWD" ]] || die "cwd is not a directory: $CWD"
+CWD="$(resolve_abs "$CWD")"
+assert_cwd_allowed "$CWD"
+cd "$CWD"
+
+FRAME=""
+case "$MODE" in
+  opinion)
+    FRAME="You are a second-opinion consultant for Grok Build. Critique from the provided text. Be concrete about risks and missing steps. Do not modify files."
+    ;;
+  review)
+    FRAME="You are reviewing work for Grok Build. Severity-ordered findings with file evidence. Do not modify files."
+    ;;
+  read)
+    FRAME="You are answering a codebase question for Grok Build. Cite paths and symbols. Do not modify files."
+    ;;
+  implement)
+    FRAME="You may implement the requested change. Keep scope tight, match project conventions, and summarize what you changed."
+    ;;
+esac
+
+FULL_PROMPT="$FRAME"$'\n\n'"$PROMPT"
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/cursor-consult-run.XXXXXX")"
+CURSOR_STDOUT="$WORKDIR/cursor-stdout.txt"
+CURSOR_STDERR="$WORKDIR/cursor-stderr.txt"
+
+ARGS=(
+  -p
+  --output-format text
+  --trust
+  --workspace "$CWD"
+)
+if [[ -n "$MODEL" ]]; then
+  ARGS+=(--model "$MODEL")
+fi
+if [[ "$MODE" == "implement" ]]; then
+  ARGS+=(--force)
+else
+  ARGS+=(--mode ask --sandbox enabled)
+fi
+
+model_log="${MODEL:-default}"
+log "mode=$MODE model=$model_log cwd=$CWD"
+
+print_answer_file() {
+  local path="$1"
+  cat "$path"
+  [[ "$(tail -c1 "$path" | wc -l)" -eq 0 ]] && echo || true
+}
+
+set +e
+"$TIMEOUT_BIN" "$TIMEOUT_SECS" -- cursor-agent "${ARGS[@]}" <<<"$FULL_PROMPT" >"$CURSOR_STDOUT" 2>"$CURSOR_STDERR"
+RC=$?
+set -e
+
+if [[ $RC -eq 124 ]]; then
+  if [[ -s "$CURSOR_STDOUT" ]]; then
+    print_answer_file "$CURSOR_STDOUT"
+  fi
+  log "timed out after ${TIMEOUT_SECS}s"
+  [[ -s "$CURSOR_STDERR" ]] && tail -c 4000 "$CURSOR_STDERR" >&2
+  exit 124
+fi
+
+if [[ -s "$CURSOR_STDOUT" ]]; then
+  print_answer_file "$CURSOR_STDOUT"
+  exit 0
+fi
+
+if [[ $RC -ne 0 ]]; then
+  log "cursor-agent exit=$RC (empty stdout)"
+  [[ -s "$CURSOR_STDERR" ]] && tail -c 8000 "$CURSOR_STDERR" >&2
+  exit "$RC"
+fi
+
+log "cursor-agent produced no stdout"
+[[ -s "$CURSOR_STDERR" ]] && tail -c 4000 "$CURSOR_STDERR" >&2
+exit 1

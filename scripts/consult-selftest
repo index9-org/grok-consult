@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# consult-selftest — no live model calls. Does not need `claude` or `codex` on PATH.
+# consult-selftest — no live model calls. Does not need `claude`, `codex`, or `cursor-agent` on PATH.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 TO="$ROOT/consult-timeout"
 CL="$ROOT/claude-consult"
 CX="$ROOT/codex-consult"
+CU="$ROOT/cursor-consult"
 TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/consult-selftest.XXXXXX")"
 ERR="$TEST_TMP/err"
 fail=0
@@ -17,8 +18,8 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-[[ -x "$TO" && -x "$CL" && -x "$CX" ]] || { echo "missing executables" >&2; exit 1; }
-bash -n "$CL" && bash -n "$CX"
+[[ -x "$TO" && -x "$CL" && -x "$CX" && -x "$CU" ]] || { echo "missing executables" >&2; exit 1; }
+bash -n "$CL" && bash -n "$CX" && bash -n "$CU"
 
 set +e
 "$TO" 1 -- /bin/sleep 5 >/dev/null 2>"$ERR"
@@ -215,6 +216,128 @@ expect2 "codex --json removed" "$CX" --mode opinion --json -- "x"
 expect2 "codex --add-dir removed" "$CX" --mode opinion --add-dir /tmp -- "x"
 expect2 "codex --skip-git-check removed" "$CX" --mode opinion --skip-git-check -- "x"
 expect2 "codex --no-timeout removed" "$CX" --mode opinion --no-timeout -- "x"
+expect2_stdin "cursor refuses \$HOME cwd" x "$CU" --mode opinion --cwd "$HOME" --stdin
+expect2_stdin "cursor refuses ~/.grok cwd" x "$CU" --mode opinion --cwd "$HOME/.grok" --stdin
+expect2_stdin "cursor empty prompt" "" "$CU" --mode opinion --stdin
+expect2_stdin "cursor review empty prompt" "" "$CU" --mode review --cwd "$TEST_TMP" --stdin
+expect2 "cursor argv prompt removed" "$CU" --mode opinion -- x
+expect2_stdin "cursor review needs cwd" x "$CU" --mode review --stdin
+expect2 "cursor raw removed" "$CU" --mode raw
+expect2 "cursor --force removed" "$CU" --mode opinion --force -- x
+expect2 "cursor --yolo removed" "$CU" --mode opinion --yolo -- x
+expect2 "cursor --effort points at model id" "$CU" --mode opinion --effort high -- x
+expect2 "cursor --approve-mcps removed" "$CU" --mode opinion --approve-mcps -- x
+expect2 "cursor --no-timeout removed" "$CU" --mode opinion --no-timeout -- x
+
+mkdir -p "$TEST_TMP/bin" "$TEST_TMP/repo"
+cat >"$TEST_TMP/bin/cursor-agent" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "status" ]]; then
+  printf '%s\n' '{"isAuthenticated": true}'
+  exit 0
+fi
+if [[ -n "${CURSOR_ARGS_FILE:-}" ]]; then
+  printf '%s\n' "$*" >"$CURSOR_ARGS_FILE"
+fi
+cat
+EOF
+chmod +x "$TEST_TMP/bin/cursor-agent"
+
+args_has() {
+  local file="$1"
+  local needle="$2"
+  grep -F -q -- "$needle" "$file"
+}
+
+run_cursor() {
+  local args_file="$1"
+  shift
+  CURSOR_ARGS_FILE="$args_file" PATH="$TEST_TMP/bin:$PATH" "$@"
+}
+
+mkdir -p "$TEST_TMP/bin-timeout"
+cat >"$TEST_TMP/bin-timeout/cursor-agent" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "status" ]]; then
+  printf '%s\n' '{"isAuthenticated": true}'
+  exit 0
+fi
+cat
+sleep 30
+EOF
+chmod +x "$TEST_TMP/bin-timeout/cursor-agent"
+set +e
+answer="$(PATH="$TEST_TMP/bin-timeout:$PATH" "$CU" --mode opinion --timeout 1 --stdin <<<"test" 2>"$ERR")"
+rc=$?
+set -e
+if [[ $rc -eq 124 && "$answer" == *test* ]]; then
+  ok "cursor timeout preserved stdin answer and returned 124"
+else
+  bad "cursor timeout rc=$rc answer=$(printf %q "$answer")"
+fi
+
+space_dir="$TEST_TMP/repo with spaces"
+mkdir -p "$space_dir"
+space_abs="$(cd "$space_dir" && pwd -P)"
+
+opinion_args="$TEST_TMP/opinion.args"
+set +e
+run_cursor "$opinion_args" "$CU" --mode opinion --stdin <<<"hello" >/dev/null 2>"$ERR"
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then
+  bad "cursor opinion spawn rc=$rc $(head -c 200 "$ERR")"
+elif args_has "$opinion_args" "--force"; then
+  bad "cursor opinion passed --force"
+elif ! args_has "$opinion_args" "--mode ask"; then
+  bad "cursor opinion missing --mode ask"
+elif ! args_has "$opinion_args" "--sandbox enabled"; then
+  bad "cursor opinion missing --sandbox enabled"
+elif ! args_has "$opinion_args" "--trust"; then
+  bad "cursor opinion missing --trust"
+elif args_has "$opinion_args" "--model"; then
+  bad "cursor opinion passed --model without request"
+else
+  ok "cursor opinion flags: ask, sandbox, trust, no --force, no --model"
+fi
+
+impl_args="$TEST_TMP/impl.args"
+set +e
+run_cursor "$impl_args" "$CU" --mode implement --cwd "$space_dir" --model "claude-opus-5[effort=high]" --stdin <<<"hello" >/dev/null 2>"$ERR"
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then
+  bad "cursor implement spawn rc=$rc $(head -c 200 "$ERR")"
+elif ! args_has "$impl_args" "--force"; then
+  bad "cursor implement missing --force"
+elif args_has "$impl_args" "--mode ask"; then
+  bad "cursor implement passed --mode ask"
+elif args_has "$impl_args" "--sandbox"; then
+  bad "cursor implement passed --sandbox"
+elif ! args_has "$impl_args" "--model claude-opus-5[effort=high]"; then
+  bad "cursor implement dropped bracket --model ($(cat "$impl_args"))"
+elif ! args_has "$impl_args" "--workspace $space_abs"; then
+  bad "cursor implement workspace mismatch ($(cat "$impl_args"))"
+else
+  ok "cursor implement flags: --force, no --mode, quoted bracket model, spaced cwd"
+fi
+
+review_args="$TEST_TMP/review.args"
+set +e
+run_cursor "$review_args" "$CU" --mode review --cwd "$TEST_TMP/repo" --stdin <<<"diff" >/dev/null 2>"$ERR"
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then
+  bad "cursor review spawn rc=$rc $(head -c 200 "$ERR")"
+elif args_has "$review_args" "--force"; then
+  bad "cursor review passed --force"
+elif ! args_has "$review_args" "--mode ask"; then
+  bad "cursor review missing --mode ask"
+else
+  ok "cursor review flags: ask, no --force"
+fi
 
 if [[ $fail -ne 0 ]]; then
   echo "consult-selftest: FAILED" >&2

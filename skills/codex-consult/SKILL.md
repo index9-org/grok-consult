@@ -5,8 +5,9 @@ description: >
   critique, uncommitted/branch/commit review, or occasional implementation.
   Use when the user says "ask Codex", "Codex review", "OpenAI second opinion",
   "have Codex look at", or codex-consult. Never auto-invoke. One Codex at
-  a time. Parallel with claude-consult only when the user asked for both.
-  Grok stays the default agent. Default model gpt-5.6-sol. Skip if `codex`
+  a time. Parallel with other consult skills only when the user asked for
+  more than one. Grok stays the default agent. Default model gpt-5.6-sol.
+  Skip if `codex`
   is not on PATH.
 ---
 
@@ -70,4 +71,4 @@ Review targets (exclusive): default `--uncommitted` · `--base <branch>` · `--c
 - Call `codex` directly.
 - Put a long prompt on argv. Use `--stdin`.
 - `--cwd ~/.grok` or `$HOME`.
-- Run two Codex consults at once. One Codex + one Claude in parallel is OK when the user asked for both.
+- Run two Codex consults at once. One of each CLI in parallel is OK when the user asked for more than one. Never two `implement` runs in the same `--cwd`.

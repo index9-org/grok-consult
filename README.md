@@ -1,8 +1,8 @@
 # consult
 
-From Grok Build, ask your local Claude Code or Codex CLI for a second opinion. Grok stays the daily driver. Never auto-invoke.
+From Grok Build, ask your local Claude Code, Codex CLI, or Cursor Agent CLI for a second opinion. Grok stays the daily driver. Never auto-invoke.
 
-You only need one CLI installed (Claude or Codex). If you have both, you can ask Grok for both at once.
+You only need one of those CLIs. If you have more than one, you can ask Grok for them at once.
 
 ## Install
 
@@ -18,14 +18,17 @@ Reload plugins (`r` in the Plugins tab, or a new session).
 - bash, python3, and git
 - **Claude Code** (`claude` on PATH, `claude auth login`): Claude Pro or Max. Not a separate Claude Code product.
 - **and/or Codex CLI** (`codex` on PATH, `codex login`): included with ChatGPT. Not a separate Codex subscription.
+- **and/or Cursor Agent CLI** (`cursor-agent` on PATH, `cursor-agent login`): a Cursor subscription. The binary is `cursor-agent`, not the editor binary named `cursor`.
 
-No Anthropic or OpenAI API keys.
+No Anthropic, OpenAI, or Cursor API keys.
 
-The wrappers only spawn those local CLIs. Claude and Codex then talk to their own services with your existing login.
+The wrappers only spawn those local CLIs. Each CLI then talks to its own service with your existing login.
+
+Cursor consult is not hermetic: it inherits `~/.cursor` config, project `AGENTS.md` / `.cursor/rules`, and any already-approved MCP servers. Read-only modes use Cursor ask mode (no `--force`). `implement` applies edits without confirmation.
 
 ## Use
 
-From Grok: "ask Claude …" or "ask Codex …". If you ask for both, Grok runs one of each together. Skills: `claude-consult`, `codex-consult`.
+From Grok: "ask Claude …", "ask Codex …", or "ask Cursor …". If you ask for more than one, Grok runs one of each together. Never two `implement` runs in the same repo. Skills: `claude-consult`, `codex-consult`, `cursor-consult`.
 
 ```bash
 # plugin directory, or $GROK_PLUGIN_ROOT after install
@@ -34,11 +37,11 @@ Review this plan: …
 EOF
 ```
 
-Same for `codex-consult`. Modes: `opinion` (default), `review`, `read`, `implement`. Optional `--model` and `--effort` (`low` | `medium` | `high` | `xhigh` | `max`). Claude defaults to `opus`; Codex to `gpt-5.6-sol`. Effort defaults to `high` (`read`: `medium`).
+Same for `codex-consult` and `cursor-consult`. Modes: `opinion` (default), `review`, `read`, `implement`. Optional `--model` and `--effort` (`low` | `medium` | `high` | `xhigh` | `max`) on Claude/Codex. Cursor has no `--effort`; put it in `--model` (`claude-opus-5-thinking-high`, `grok-4.6[effort=high]`). Claude defaults to `opus`; Codex to `gpt-5.6-sol`; Cursor omits `--model` and uses the CLI selected model.
 
 Grok shell timeout: 960000 ms. Wrapper default kill: 900s.
 
-Never `--bare` (that skips Claude OAuth). Never call `claude` or `codex` directly from Grok.
+Never `--bare` (that skips Claude OAuth). Never call `claude`, `codex`, `cursor-agent`, or `cursor` directly from Grok.
 
 ## Maintainers
 

@@ -5,8 +5,8 @@ description: >
   opinion, plan critique, diff review, or occasional implementation. Use when
   the user says "ask Claude", "Claude's opinion", "have Claude review",
   "second opinion from Claude Code", or claude-consult. Never auto-invoke.
-  One Claude at a time. Parallel with codex-consult only when the user
-  asked for both. Grok stays the default agent. Prefer brain-only opinion
+  One Claude at a time. Parallel with other consult skills only when the
+  user asked for more than one. Grok stays the default agent. Prefer brain-only opinion
   mode. Skip if `claude` is not on PATH.
 ---
 
@@ -68,4 +68,4 @@ Empty stdin fails (including a clean `git diff`). That is expected.
 - Call `claude` directly.
 - Put a long prompt on argv. Use `--stdin`.
 - Use `--bare` or `--cwd ~/.grok`.
-- Run two Claude consults at once. One Claude + one Codex in parallel is OK when the user asked for both.
+- Run two Claude consults at once. One of each CLI in parallel is OK when the user asked for more than one. Never two `implement` runs in the same `--cwd`.
